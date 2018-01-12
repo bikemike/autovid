@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+#
+# Copyright (c) 2014 Michael Morrison
+# (See LICENSE.txt)
+#
+# redirect the output of this script to a file:
+# ./autovid > clips.melt
+# then try it with melt:
+#   melt clips.melt
+# if you like it, you can output it to a video:
+# melt test_mix.melt -progress -consumer avformat:OUT.avi acodec=libmp3lame vcodec=libx264
+# ideas: 
+#   duration range (pick a random duration from within the range)
+
+# FIXME: hardcoded video size. specify output video size
+# TODO: option to add watermark to the video clips 
+# TODO: option to increase/decrease clip duration over time
+# TODO: option to show a quick preview (shorter duration) of all or some of the clips before showing each clip
+# TODO: fade from black at the start and fade to black at the end
+# TODO: option to overlay date/time
+# TODO: option to join full videos clips
+# TODO: option to pick one video per day and put a year/month/day overlay on it
+# TODO: option for minimum clip length ie -md 4 if clip is 1 second, but you want 4 second clips, don't include
+# TODO: option to skip videos shorter than a certain length
+# TODO: more options for where to pick the clip from (start, middle, end, random)
+# TODO: pull start position out of a file or database (filename, start position (best))
+# TODO: pull clip duration out of a file or database (file, start time, end position)
+# TODO: ges and/or ges-launch-1.0 support
+
+
+import sys
+import argparse
+import random
+import math
+import io
+import struct
+
+import gi 
+gi.require_version('Gst', '1.0')
+from gi.repository import Gio
+from gi.repository import GObject
+
+GObject.threads_init()
+
+from gi.repository import Gst
+Gst.init(sys.argv)
+gi.require_version('GstPbutils', '1.0')
+from gi.repository import GstPbutils
+#from gst.extend import discoverer
+#import gst.pbutils
+
+
+# =============================================================================
+# calc_mlt_image_size - find the media from the command line paths
+# =============================================================================
+# in MLT, the image will be scaled to dstw, dsth but if the ratio is not the
+# same, the image will have borders around it. this function calculates the
+# size the image needs to be to fill the screen
+def calc_mlt_img_size(srcw, srch, dstw, dsth, zoom=1):
+	w = dstw 
+	h = dsth 
+
+	src_ratio = srcw/srch;
+	dst_ratio = dstw/dsth;
+
+	offset_range_x = []
+	offset_range_y = []
+
+	img_w = w
+	img_h = h
+
+	if src_ratio < dst_ratio:
+		# src width is smaller
+		diff_ratio = (dstw * srch)/(dsth*srcw)
+		w = dstw * diff_ratio
+		h = dsth * diff_ratio
+		img_h = h
+	elif src_ratio > dst_ratio:
+		# src height is smaller
+		diff_ratio = (dsth * srcw)/(dstw*srch)
+		w = dstw * diff_ratio
+		h = dsth * diff_ratio
+		img_w = w
+
+	w = math.ceil(w*zoom)
+	h = math.ceil(h*zoom)
+	img_w = math.ceil(img_w*zoom)
+	img_h = math.ceil(img_h*zoom)
+
+	offsetx = (w -img_w)/2
+	x1 = -math.ceil(offsetx)
+	x2 = -math.ceil(w - offsetx -dstw)
+
+# 960 - 
+	offsety = (h -img_h)/2
+	y1 = -math.ceil(offsety)
+	y2 = -math.ceil(h - offsety -dsth)
+
+	offset_range_x.append( x1 )
+	offset_range_x.append( x2 )
+	offset_range_y.append( y1 )
+	offset_range_y.append( y2 )
+	
+	return w, h, offset_range_x, offset_range_y
+
+
+# =============================================================================
+# get_image_size - modified from:
+# http://markasread.net/post/17551554979/get-image-size-info-using-pure-python-code
+# =============================================================================
+def get_image_size(path):
+	"""
+	Return (content_type, width, height) for a given img file content
+	no requirements
+	"""
+	f = open(path, 'rb')
+	data = open(path, 'rb').read(25)
+	size = len(data)
+	height = -1
+	width = -1
+
+	# handle GIFs
+	if (size >= 10) and data[:6] in ('GIF87a', 'GIF89a'):
+		# Check to see if content_type is correct
+		w, h = struct.unpack("<HH", data[6:10])
+		width = int(w)
+		height = int(h)
+
+	# See PNG 2. Edition spec (http://www.w3.org/TR/PNG/)
+	# Bytes 0-7 are below, 4-byte chunk length, then 'IHDR'
+	# and finally the 4-byte width, height
+	elif ((size >= 24) and data.startswith(b'\211PNG\r\n\032\n')
+			and (data[12:16] == b'IHDR')):
+		w, h = struct.unpack(">LL", data[16:24])
+		width = int(w)
+		height = int(h)
+
+	# Maybe this is for an older PNG version.
+	elif (size >= 16) and data.startswith(b'\211PNG\r\n\032\n'):
+		# Check to see if we have the right content type
+		w, h = struct.unpack(">LL", data[8:16])
+		width = int(w)
+		height = int(h)
+
+	# handle JPEGs
+	elif (size >= 2) and data.startswith(b'\377\330'):
+		f.seek(0)
+		f.read(2)
+		b = f.read(1)
+		try:
+			while (b != b'\xDA'):
+				while (b != b'\xFF'):
+					b = f.read(1)
+				while (b == b'\xFF'):
+					b = f.read(1)
+				if (b >= b'\xC0' and b <= b'\xC3'):
+					f.read(3)
+					h, w = struct.unpack(">HH", f.read(4))
+					break
+				else:
+					f.read(int(struct.unpack(">H", f.read(2))[0])-2)
+				b = f.read(1)
+			width = int(w)
+			height = int(h)
+		except struct.error:
+			pass
+		except ValueError:
+			pass
+	return width, height
+# =============================================================================
+# create_mlt_filter_ken_burns
+# creates an mlt filter that zooms and pans over an image
+# =============================================================================
+
+def create_mlt_filter_ken_burns(uri, num_frames):
+	gfile = Gio.file_new_for_uri(uri)
+	width, height = get_image_size(gfile.get_path())
+	#print("image width, height: " + str(width) + "x" + str(height))
+	dst_w = 1280
+	dst_h = 720
+	w, h, ox, oy = calc_mlt_img_size(width, height, dst_w, dst_h)
+	#print (str(w) + 'x' + str(h))
+
+	zoom = random.uniform(1.02, 1.10);
+	wz = w * zoom
+	hz = h * zoom 
+	#print("random zoom: " + str(zoom) + ' = ' + str(wz) + 'x' + str(hz))
+
+	w2, h2, ox2, oy2 = calc_mlt_img_size(width, height, dst_w, dst_h,zoom)
+	#print (str(w2) + 'x' + str(h2))
+
+	# FIXME if the range of motion is greater in x or y direction,
+	# limit it to the range of the other direction 
+	# if zoom = 0, there should be no panning in x or y
+	ox_range = max(ox) - min(ox)
+	oy_range = max(oy) - min(oy)
+	# 2 - 10 , r 3
+	if ox_range < oy_range:
+		diff = oy_range - ox_range
+		offset = random.randint(0, diff)
+		oy = [min(oy) + offset, min(oy) + offset + ox_range]
+	else:
+		diff = ox_range - oy_range
+		offset = random.randint(0, diff)
+		ox = [min(ox) + offset, min(ox) + offset + oy_range]
+	ox2 = [ox[0]*zoom, ox[1]*zoom - dst_w * zoom + dst_w]
+	oy2 = [oy[0]*zoom, oy[1]*zoom - dst_h * zoom + dst_h]
+	fromx = round(random.uniform(ox[0], ox[1]))
+	fromy = round(random.uniform(oy[0], oy[1]))
+	tox   = round(random.uniform(ox2[0], ox2[1]))
+	toy   = round(random.uniform(oy2[0], oy2[1]))
+
+	# randomly swap to/from so we get zoom in and zoom out
+	if random.choice([True, False]):
+		fromx,tox = tox,fromx
+		fromy,toy = toy,fromy
+		w,w2 = w2, w
+		h,h2 = h2, h
+	#print ("from: " + str(fromx) + '/' + str(fromy) + ' to ' + str(tox) + '/' + str(toy))
+	#print ('0=' + str(fromx) + '/' + str(fromy) + ':' + str(w) + 'x' + str(h) + ':100;' + str(num_frames-1) + '='
+		#+ str(tox) + '/' + str(toy) + ':' + str(w2) + 'x' + str(h2) + ':100;')
+
+	filter = '\t\t<filter out="' + str(num_frames-1) + '">\n'
+	filter = filter + '\t\t\t<property name="mlt_type">filter</property>\n'
+	filter = filter + '\t\t\t<property name="mlt_service">affine</property>\n'
+	filter = filter + '\t\t\t<property name="transition.geometry">'
+	filter = filter + '0=' + str(fromx) + '/' + str(fromy) + ':' + str(w) + 'x' + str(h) + ':100;' + str(num_frames-1) + '=' + str(tox) + '/' + str(toy) + ':' + str(w2) + 'x' + str(h2) + ':100;'
+	filter = filter + '</property>\n'
+	filter = filter + '\t\t</filter>'
+	return filter
+
+
+# =============================================================================
+# get_media - find the media from the command line paths
+# =============================================================================
+def get_media(uris):
+	media = []
+	for uri in uris:
+		gpath = Gio.file_new_for_uri(uri)
+		ginfo = gpath.query_info('standard::name,standard::type,standard::size,standard::content-type', Gio.FileQueryInfoFlags.NONE, None)
+		if ginfo.get_file_type() == Gio.FileType.DIRECTORY:
+			enumerator = gpath.enumerate_children('standard::name,standard::type,standard::size,standard::content-type',Gio.FileQueryInfoFlags.NONE, None)
+			child_info = enumerator.next_file(None)
+			paths = []
+			while child_info != None:
+				child = gpath.get_child(child_info.get_name())
+				if child_info.get_file_type() == Gio.FileType.DIRECTORY:
+					paths.append(child.get_uri())
+				if child_info.get_content_type().startswith("video"):
+					paths.append(child.get_uri())
+				child_info = enumerator.next_file(None)
+			paths.sort()
+			media.extend(get_media(paths));
+		else:
+			if ginfo.get_content_type().startswith("video"):
+				media.append(uri)
+			elif ginfo.get_content_type().startswith("image"):
+				media.append(uri)
+
+	return media
+
+
+def main(argv):
+	parser = argparse.ArgumentParser(description='Join all videos found inside specified folders into one video.')
+
+	group = parser.add_mutually_exclusive_group()
+	group.add_argument('-d', '--duration', type=float,default='1', help='number of seconds to pluck from each video.')
+	group.add_argument('-D', '--duration_range', type=float,nargs=2, help='number of seconds to pluck from each video in the range.')
+	parser.add_argument('-p', '--position', choices=['start', 'start+1s','middle','end-1s','end','random'], default='middle', help='position to pluck the clip from.')
+
+	group = parser.add_mutually_exclusive_group()
+	group.add_argument('-t', '--transitions', action='store_true', help='enable audio/video transitions between clips.')
+	group.add_argument('-a', '--audio_transitions', action='store_true', help='enable _only_ audio transitions between clips.')
+
+	parser.add_argument('-o', '--order', choices=['sorted','as-is','random'],default='as-is', help='the order of clips')
+	parser.add_argument('-f', '--format', choices=['melt','melt_xml','ges','info'], default='info', help='output format.')
+	parser.add_argument('-m', '--max_videos', type=int, help='limit the number of videos to use. if more are found, it will randomly select the ones to use.')
+	parser.add_argument('-T', '--title_image', type=str, help='choose a title image to show first for a specified period of time')
+	parser.add_argument('-Td', '--title_duration', type=int,default=3, help='the duration to show the title image for')
+	parser.add_argument('-A', '--audio_track', type=str,action='append', help='add an audio track. can be specified multiple times.')
+	parser.add_argument('PATH', nargs='+', help='files or folders to search.')
+	args = parser.parse_args();
+
+	#print args.duration
+	#print args.position
+	#print args.FOLDERS
+	#print args.transitions
+	if (args.format == "info"):
+		print(args)
+	elif (args.format == "ges"):
+		print("ges not implemented yet")
+	elif (args.format == "melt_xml"):
+		print("<mlt>")
+	duration_range = [args.duration, args.duration]
+
+	if args.duration_range:
+		duration_range = args.duration_range;
+
+	uris = []
+	for path in args.PATH:
+		gpath = Gio.file_new_for_path(path)
+		uris.append(gpath.get_uri())
+
+	videos = get_media(uris);
+
+	if args.max_videos and args.max_videos < len(videos):
+		print ("only picking " + str(args.max_videos) + " of " + str(len(videos)))
+		videos = random.sample(videos, args.max_videos)
+
+	if (args.order == 'sorted'):
+		videos.sort()
+	elif (args.order == 'random'):
+		random.shuffle(videos)
+	
+	has_title = False
+	if (args.title_image):
+		gpath = Gio.file_new_for_path(args.title_image)
+		if (gpath.query_exists()):
+			videos.insert(0, gpath.get_uri())
+			has_title = True
+
+
+	discoverer = GstPbutils.Discoverer.new(Gst.SECOND * 10) # nanoseconds (equal to 10 seconds)
+
+	iteration = 0
+	total_frames = 0
+	playlist_entries = ""
+	frame_duration_last = 0
+
+	if (args.transitions or args.audio_transitions):
+		transition_frames = int(30 / 4) # hardcode transition to 1/4
+	else:
+		transition_frames = 0
+
+	for video in videos:
+		gfile = Gio.file_new_for_uri(video)
+		ginfo = gfile.query_info('standard::name,standard::type,standard::size,standard::content-type', Gio.FileQueryInfoFlags.NONE, None)
+		clip_duration = random.uniform(duration_range[0], duration_range[1]);
+
+		if (args.transitions or args.audio_transitions):
+			clip_duration = clip_duration + 1/4  # add a quarter of a second for the transition
+
+		if iteration == 0 and has_title:
+			clip_duration = args.title_duration
+
+		if ginfo.get_content_type().startswith("video"):
+			try:
+				video_info = discoverer.discover_uri(video)
+			except GObject.GError as e:
+				print("ERROR in " + video + ": " + e.message, file=sys.stderr)
+				continue
+
+			video_duration = video_info.get_duration() / Gst.SECOND;
+
+			for stream_info in video_info.get_video_streams():
+				framerate = stream_info.get_framerate_num() / stream_info.get_framerate_denom()
+
+			# make sure video is long enough
+			if video_duration < min(duration_range):
+				continue
+		else:
+			video_duration = clip_duration
+			framerate = 30
+			
+
+
+		if args.position == 'start':
+			clip_start = 0
+		elif args.position == 'start+1s':
+			clip_start = 1
+		elif args.position == "middle":
+			clip_start = video_duration/2 - clip_duration/2;
+		elif args.position == "end-1s":
+			clip_start = video_duration - 1 - clip_duration;
+		elif args.position == "end":
+			clip_start = video_duration- clip_duration;
+		elif args.position == "random":
+			clip_start = random.uniform(0, video_duration - clip_duration)
+
+		clip_start = max(0, clip_start)
+
+		clip_end = min(clip_start + clip_duration, video_duration)
+		
+		frame_start = round(clip_start * framerate)
+		frame_end = round(clip_end * framerate) - 1
+		frame_duration = frame_end + 1 - frame_start
+
+		
+		if (args.format == "melt"):
+			print(gfile.get_path())
+			print("in=" + str(frame_start))
+			print("out=" + str(frame_end))
+			if (args.transitions or args.audio_transitions) and iteration != 0:
+				print("-mix")
+				print(str(int(transition_frames)))
+				print("-mixer")
+				print("mix:-1")
+			if args.transitions and iteration != 0:
+				print("-mixer")
+				print("luma")
+		elif (args.format == "melt_xml"):
+			print('\t<producer id="p' + str(iteration) + '" in="' + str(frame_start) + '" out="' + str(frame_end) + '">')
+			print('\t\t<property name="resource"><![CDATA[' + gfile.get_path()  + ']]></property>')
+			if ginfo.get_content_type().startswith("image"):
+				 print(create_mlt_filter_ken_burns(video, frame_duration))
+			print('	</producer>')
+
+			if (args.transitions or args.audio_transitions) and iteration != 0:
+				trans_id = "trans_p" + str(iteration-1) + '_p'+ str(iteration)
+				print('	<tractor id="' + trans_id  +'" in="" out="">')
+				print('		<track producer="p' + str(iteration-1) + '" in="'+str(frame_duration_last - transition_frames)+'" out="'+str(frame_duration_last - 1)+'"/>')
+				print('		<track producer="p' + str(iteration) + '" in="0" out="'+str(transition_frames - 1)+'"/>')
+				print('		<transition mlt_service="mix" in="0" out="' + str(transition_frames - 1) + '" a_track="0" b_track="1">')
+				print('			<property name="start">0.0</property>')
+				print('			<property name="end">1.0</property>')
+				print('		</transition>')
+				if args.transitions:
+					print('		<transition mlt_service="luma" in="0" out="' + str(transition_frames - 1) + '" a_track="0" b_track="1"/>')
+
+				print('	</tractor>')
+				playlist_entries = playlist_entries + '\t\t<entry producer="' + trans_id + '" in="0" out="' + str(transition_frames - 1) + '"/>\n'
+				total_frames = total_frames + transition_frames
+
+			playlist_entries = playlist_entries + '\t\t<entry producer="p' + str(iteration) + '" in="' + str(transition_frames if iteration else 0) + '" out="' + str(frame_duration - 1 - transition_frames) + '"/>\n'
+			total_frames = total_frames + (frame_duration - transition_frames) - (transition_frames if iteration else 0)
+		elif (args.format == "ges"):
+			#print("ges not implemented yet")
+			pass
+		else:
+			print(gfile.get_path())
+			print("framerate: " + str(framerate))
+			print ('duration: ' + str(round(video_duration,4)) + "s. Clip from " 
+				+ str(round(clip_start,4)) + "s (frame " + str(frame_start) + ") to " 
+				+ str(round(clip_end,4)) + "s (frame " + str(frame_end) + ")")
+			print()
+
+		iteration = iteration + 1
+		frame_duration_last = frame_duration
+
+	if args.format == "info":
+		#minutes = int(total_duration / 60);
+		#seconds = round(total_duration,2) - minutes * 60;
+		#print("Total video time: " + str(minutes) + "m " + str(seconds) +  "s" )
+		pass
+	elif (args.format == "melt_xml"):
+		# add music
+		audio_playlist = ''
+		total_audio_duration = 0
+		while (total_audio_duration < total_frames):
+			if (args.audio_track is None):
+				break;
+			for audio in args.audio_track:
+				if (total_audio_duration >= total_frames):
+					break
+				gpath = Gio.file_new_for_path(audio)
+				ginfo = gpath.query_info('standard::name,standard::type,standard::size,standard::content-type', Gio.FileQueryInfoFlags.NONE, None)
+				if ginfo.get_content_type().startswith("audio"):
+					try:
+						audio_info = discoverer.discover_uri(gpath.get_uri())
+					except GObject.GError as e:
+						print("ERROR in " + audio + ": " + e.message, file=sys.stderr)
+						continue
+
+				audio_duration = audio_info.get_duration() / Gst.SECOND;
+				audio_duration = int(audio_duration * framerate)
+
+				if (total_audio_duration + audio_duration > total_frames):
+					audio_duration = total_frames - total_audio_duration
+
+				total_audio_duration = total_audio_duration + audio_duration
+
+				audio_frame_last = audio_duration - 1
+
+
+				print('\t<producer id="a' + str(iteration) + '" in="' + str(0) + '" out="' + str(audio_frame_last) + '">')
+				print('\t\t<property name="resource"><![CDATA[' + audio + ']]></property>')
+				print('	</producer>')
+				audio_playlist = audio_playlist + '\t\t<entry producer="a' + str(iteration) + '" in="' + str(0) + '" out="' + str(audio_frame_last) + '">\n'
+				audio_playlist = audio_playlist + '\t\t\t<filter in="0" out="60">\n'
+				audio_playlist = audio_playlist + '\t\t\t\t<property name="mlt_service">volume</property>\n'
+				audio_playlist = audio_playlist + '\t\t\t\t<property name="mlt_type">filter</property>\n'
+				audio_playlist = audio_playlist + '\t\t\t\t<property name="gain">0.0</property>\n'
+				audio_playlist = audio_playlist + '\t\t\t\t<property name="end">1.0</property>\n'
+				audio_playlist = audio_playlist + '\t\t\t</filter>\n'
+				audio_playlist = audio_playlist + '\t\t\t<filter in="' + str(audio_frame_last - 60) + '" out="' + str(audio_frame_last) + '">\n'
+				audio_playlist = audio_playlist + '\t\t\t\t<property name="mlt_service">volume</property>\n'
+				audio_playlist = audio_playlist + '\t\t\t\t<property name="mlt_type">filter</property>\n'
+				audio_playlist = audio_playlist + '\t\t\t\t<property name="gain">1.0</property>\n'
+				audio_playlist = audio_playlist + '\t\t\t\t<property name="end">0.0</property>\n'
+				audio_playlist = audio_playlist + '\t\t\t</filter>\n'
+				audio_playlist = audio_playlist + '\t\t</entry>\n'
+				iteration = iteration + 1
+		print('	<playlist id="audio" >')
+		print(audio_playlist,end="")
+		print('	</playlist>')
+		print('	<playlist id="video">')
+		print(playlist_entries,end="")
+		print('	</playlist>')
+		print('	<tractor>')
+		print('		<track producer="audio" hide="video"/>')
+		print('		<track producer="video"/>')
+		print('		<transition>')
+		print('			<property a_track="1" b_track="2" mlt_service="mix"/>')
+		print('		</transition>')
+		print('	</tractor>')
+		print('</mlt>')
+
+		
+
+
+if __name__ == "__main__":
+	main(sys.argv[1:])

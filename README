@@ -1,0 +1,38 @@
+usage: autovid [-h] [-d DURATION | -D DURATION_RANGE DURATION_RANGE]
+               [-p {start,start+1s,middle,end-1s,end,random}] [-t | -a]
+               [-o {sorted,as-is,random}] [-f {melt,melt_xml,ges,info}]
+               [-m MAX_VIDEOS] [-T TITLE_IMAGE] [-Td TITLE_DURATION]
+               [-A AUDIO_TRACK]
+               PATH [PATH ...]
+
+Join all videos found inside specified folders into one video.
+
+positional arguments:
+  PATH                  files or folders to search.
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -d DURATION, --duration DURATION
+                        number of seconds to pluck from each video.
+  -D DURATION_RANGE DURATION_RANGE, --duration_range DURATION_RANGE DURATION_RANGE
+                        number of seconds to pluck from each video in the
+                        range.
+  -p {start,start+1s,middle,end-1s,end,random}, --position {start,start+1s,middle,end-1s,end,random}
+                        position to pluck the clip from.
+  -t, --transitions     enable audio/video transitions between clips.
+  -a, --audio_transitions
+                        enable _only_ audio transitions between clips.
+  -o {sorted,as-is,random}, --order {sorted,as-is,random}
+                        the order of clips
+  -f {melt,melt_xml,ges,info}, --format {melt,melt_xml,ges,info}
+                        output format.
+  -m MAX_VIDEOS, --max_videos MAX_VIDEOS
+                        limit the number of videos to use. if more are found,
+                        it will randomly select the ones to use.
+  -T TITLE_IMAGE, --title_image TITLE_IMAGE
+                        choose a title image to show first for a specified
+                        period of time
+  -Td TITLE_DURATION, --title_duration TITLE_DURATION
+                        the duration to show the title image for
+  -A AUDIO_TRACK, --audio_track AUDIO_TRACK
+                        add an audio track. can be specified multiple times.
