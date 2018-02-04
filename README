@@ -1,8 +1,11 @@
+face detection requires python3-opencv and opencv-data
+
+
 usage: autovid [-h] [-d DURATION | -D DURATION_RANGE DURATION_RANGE]
                [-p {start,start+1s,middle,end-1s,end,random}] [-t | -a]
                [-o {sorted,as-is,random}] [-f {melt,melt_xml,ges,info}]
                [-m MAX_VIDEOS] [-T TITLE_IMAGE] [-Td TITLE_DURATION]
-               [-A AUDIO_TRACK]
+               [--face_detection] [-A AUDIO_TRACK]
                PATH [PATH ...]
 
 Join all videos found inside specified folders into one video.
@@ -34,5 +37,7 @@ optional arguments:
                         period of time
   -Td TITLE_DURATION, --title_duration TITLE_DURATION
                         the duration to show the title image for
+  --face_detection      for images, use face detection to determine image
+                        centering
   -A AUDIO_TRACK, --audio_track AUDIO_TRACK
                         add an audio track. can be specified multiple times.

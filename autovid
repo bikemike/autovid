@@ -34,6 +34,7 @@ import random
 import math
 import io
 import struct
+import cv2
 
 import gi 
 gi.require_version('Gst', '1.0')
@@ -56,52 +57,23 @@ from gi.repository import GstPbutils
 # in MLT, the image will be scaled to dstw, dsth but if the ratio is not the
 # same, the image will have borders around it. this function calculates the
 # size the image needs to be to fill the screen
-def calc_mlt_img_size(srcw, srch, dstw, dsth, zoom=1):
-	w = dstw 
-	h = dsth 
+def calc_mlt_img(srcw, srch, dstw, dsth):
+	# 100%
+	x = 100 
+	y = 100 
 
 	src_ratio = srcw/srch;
 	dst_ratio = dstw/dsth;
 
-	offset_range_x = []
-	offset_range_y = []
-
-	img_w = w
-	img_h = h
-
 	if src_ratio < dst_ratio:
-		# src width is smaller
-		diff_ratio = (dstw * srch)/(dsth*srcw)
-		w = dstw * diff_ratio
-		h = dsth * diff_ratio
-		img_h = h
+		# src width is smaller, increase y by %
+		y = 100 * dst_ratio / src_ratio ;
 	elif src_ratio > dst_ratio:
-		# src height is smaller
-		diff_ratio = (dsth * srcw)/(dstw*srch)
-		w = dstw * diff_ratio
-		h = dsth * diff_ratio
-		img_w = w
+		# src height is smaller, increase x by %
+		x = 100 * dst_ratio / src_ratio;
 
-	w = math.ceil(w*zoom)
-	h = math.ceil(h*zoom)
-	img_w = math.ceil(img_w*zoom)
-	img_h = math.ceil(img_h*zoom)
-
-	offsetx = (w -img_w)/2
-	x1 = -math.ceil(offsetx)
-	x2 = -math.ceil(w - offsetx -dstw)
-
-# 960 - 
-	offsety = (h -img_h)/2
-	y1 = -math.ceil(offsety)
-	y2 = -math.ceil(h - offsety -dsth)
-
-	offset_range_x.append( x1 )
-	offset_range_x.append( x2 )
-	offset_range_y.append( y1 )
-	offset_range_y.append( y2 )
 	
-	return w, h, offset_range_x, offset_range_y
+	return x, y, x-100, y-100
 
 
 # =============================================================================
@@ -172,59 +144,81 @@ def get_image_size(path):
 # creates an mlt filter that zooms and pans over an image
 # =============================================================================
 
-def create_mlt_filter_ken_burns(uri, num_frames):
+def create_mlt_filter_ken_burns(uri, num_frames, face_detection):
 	gfile = Gio.file_new_for_uri(uri)
 	width, height = get_image_size(gfile.get_path())
-	#print("image width, height: " + str(width) + "x" + str(height))
-	dst_w = 1280
-	dst_h = 720
-	w, h, ox, oy = calc_mlt_img_size(width, height, dst_w, dst_h)
-	#print (str(w) + 'x' + str(h))
+	print("image width, height: " + str(width) + "x" + str(height))
+	dst_w = 1920
+	dst_h = 1080
+	w, h, dx, dy = calc_mlt_img(width, height, dst_w, dst_h)
 
-	zoom = random.uniform(1.02, 1.10);
-	wz = w * zoom
-	hz = h * zoom 
-	#print("random zoom: " + str(zoom) + ' = ' + str(wz) + 'x' + str(hz))
+	#startx = -random.uniform(0.0,dx)
+	#starty = -random.uniform(0.0,dy)
+	startx = -dx/3
+	starty = -dy/3
 
-	w2, h2, ox2, oy2 = calc_mlt_img_size(width, height, dst_w, dst_h,zoom)
-	#print (str(w2) + 'x' + str(h2))
+	if (face_detection):
+		# if image has faces, center around them
+		cascPath = "/usr/share/opencv/haarcascades/haarcascade_frontalface_alt.xml"
+		faceCascade = cv2.CascadeClassifier(cascPath)
+		image = cv2.imread(gfile.get_path())
+		gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-	# FIXME if the range of motion is greater in x or y direction,
-	# limit it to the range of the other direction 
-	# if zoom = 0, there should be no panning in x or y
-	ox_range = max(ox) - min(ox)
-	oy_range = max(oy) - min(oy)
-	# 2 - 10 , r 3
-	if ox_range < oy_range:
-		diff = oy_range - ox_range
-		offset = random.randint(0, diff)
-		oy = [min(oy) + offset, min(oy) + offset + ox_range]
-	else:
-		diff = ox_range - oy_range
-		offset = random.randint(0, diff)
-		ox = [min(ox) + offset, min(ox) + offset + oy_range]
-	ox2 = [ox[0]*zoom, ox[1]*zoom - dst_w * zoom + dst_w]
-	oy2 = [oy[0]*zoom, oy[1]*zoom - dst_h * zoom + dst_h]
-	fromx = round(random.uniform(ox[0], ox[1]))
-	fromy = round(random.uniform(oy[0], oy[1]))
-	tox   = round(random.uniform(ox2[0], ox2[1]))
-	toy   = round(random.uniform(oy2[0], oy2[1]))
+		# Detect faces in the image
+		faces = faceCascade.detectMultiScale(
+			gray,
+			scaleFactor=1.05,
+			minNeighbors=4,
+			minSize=(30, 30),
+			flags = cv2.CASCADE_SCALE_IMAGE
+		)
+		if (len(faces)):
+			total_weight = 0;
+			posx = 0;
+			posy = 0;
+			for (fx, fy, fw, fh) in faces:
+				fpx = fx + fw/2
+				fpy = fy + fh/2
+				fweight = fw*fh/ (width*height)
+				posx += fpx * fweight;
+				posy += fpy * fweight;
+				total_weight += fweight
+			posx = posx/total_weight;
+			posy = posy/total_weight;
+
+			startx = min(max(-dx,-dx/2 - (posx/width*100 - 50)),0);
+			starty = min(max(-dy,-dy/2 - (posy/height*100 - 50)),0);
+			
+
+	endx = startx * 1.1 - 5;
+	endy = starty * 1.1 - 5;
+	endw  = w * 1.1;
+	endh  = h * 1.1;
+
+	zdx = random.uniform(0.0,5.0)
+	zdy = math.sqrt(5*5 - zdx*zdx)
+	if random.choice([True, False]):
+		zdx = -zdx;
+	if random.choice([True, False]):
+		zdy = -zdy;
+
+	endx += zdx;
+	endy += zdy;
 
 	# randomly swap to/from so we get zoom in and zoom out
 	if random.choice([True, False]):
-		fromx,tox = tox,fromx
-		fromy,toy = toy,fromy
-		w,w2 = w2, w
-		h,h2 = h2, h
-	#print ("from: " + str(fromx) + '/' + str(fromy) + ' to ' + str(tox) + '/' + str(toy))
-	#print ('0=' + str(fromx) + '/' + str(fromy) + ':' + str(w) + 'x' + str(h) + ':100;' + str(num_frames-1) + '='
-		#+ str(tox) + '/' + str(toy) + ':' + str(w2) + 'x' + str(h2) + ':100;')
+		startx, endx = endx, startx
+		starty, endy = endy, starty
+		w, endw = endw, w
+		h, endh = endh, h
 
+
+	
 	filter = '\t\t<filter out="' + str(num_frames-1) + '">\n'
 	filter = filter + '\t\t\t<property name="mlt_type">filter</property>\n'
 	filter = filter + '\t\t\t<property name="mlt_service">affine</property>\n'
 	filter = filter + '\t\t\t<property name="transition.geometry">'
-	filter = filter + '0=' + str(fromx) + '/' + str(fromy) + ':' + str(w) + 'x' + str(h) + ':100;' + str(num_frames-1) + '=' + str(tox) + '/' + str(toy) + ':' + str(w2) + 'x' + str(h2) + ':100;'
+	filter = filter + '0=' + "{:.2f}".format(startx) + '%/' + "{:.2f}".format(starty) + '%:' + "{:.2f}".format(w) + '%x' + "{:.2f}".format(h) + '%:100;' + str(num_frames-1) + '=' + "{:.2f}".format(endx) + '%/' + "{:.2f}".format(endy) + '%:' + "{:.2f}".format(endw) + '%x' + "{:.2f}".format(endh) + '%:100;'
 	filter = filter + '</property>\n'
 	filter = filter + '\t\t</filter>'
 	return filter
@@ -246,7 +240,9 @@ def get_media(uris):
 				child = gpath.get_child(child_info.get_name())
 				if child_info.get_file_type() == Gio.FileType.DIRECTORY:
 					paths.append(child.get_uri())
-				if child_info.get_content_type().startswith("video"):
+				elif child_info.get_content_type().startswith("video"):
+					paths.append(child.get_uri())
+				elif child_info.get_content_type().startswith("image"):
 					paths.append(child.get_uri())
 				child_info = enumerator.next_file(None)
 			paths.sort()
@@ -277,6 +273,7 @@ def main(argv):
 	parser.add_argument('-m', '--max_videos', type=int, help='limit the number of videos to use. if more are found, it will randomly select the ones to use.')
 	parser.add_argument('-T', '--title_image', type=str, help='choose a title image to show first for a specified period of time')
 	parser.add_argument('-Td', '--title_duration', type=int,default=3, help='the duration to show the title image for')
+	parser.add_argument('--face_detection', action='store_true', help='for images, use face detection to determine image centering')
 	parser.add_argument('-A', '--audio_track', type=str,action='append', help='add an audio track. can be specified multiple times.')
 	parser.add_argument('PATH', nargs='+', help='files or folders to search.')
 	args = parser.parse_args();
@@ -301,22 +298,22 @@ def main(argv):
 		gpath = Gio.file_new_for_path(path)
 		uris.append(gpath.get_uri())
 
-	videos = get_media(uris);
+	files = get_media(uris);
 
-	if args.max_videos and args.max_videos < len(videos):
-		print ("only picking " + str(args.max_videos) + " of " + str(len(videos)))
-		videos = random.sample(videos, args.max_videos)
+	if args.max_videos and args.max_videos < len(files):
+		#print ("only picking " + str(args.max_videos) + " of " + str(len(files)))
+		files = random.sample(files, args.max_videos)
 
 	if (args.order == 'sorted'):
-		videos.sort()
+		files.sort()
 	elif (args.order == 'random'):
-		random.shuffle(videos)
+		random.shuffle(files)
 	
 	has_title = False
 	if (args.title_image):
 		gpath = Gio.file_new_for_path(args.title_image)
 		if (gpath.query_exists()):
-			videos.insert(0, gpath.get_uri())
+			files.insert(0, gpath.get_uri())
 			has_title = True
 
 
@@ -332,8 +329,8 @@ def main(argv):
 	else:
 		transition_frames = 0
 
-	for video in videos:
-		gfile = Gio.file_new_for_uri(video)
+	for file in files:
+		gfile = Gio.file_new_for_uri(file)
 		ginfo = gfile.query_info('standard::name,standard::type,standard::size,standard::content-type', Gio.FileQueryInfoFlags.NONE, None)
 		clip_duration = random.uniform(duration_range[0], duration_range[1]);
 
@@ -345,9 +342,9 @@ def main(argv):
 
 		if ginfo.get_content_type().startswith("video"):
 			try:
-				video_info = discoverer.discover_uri(video)
+				video_info = discoverer.discover_uri(file)
 			except GObject.GError as e:
-				print("ERROR in " + video + ": " + e.message, file=sys.stderr)
+				print("ERROR in " + file + ": " + e.message, file=sys.stderr)
 				continue
 
 			video_duration = video_info.get_duration() / Gst.SECOND;
@@ -402,7 +399,7 @@ def main(argv):
 			print('\t<producer id="p' + str(iteration) + '" in="' + str(frame_start) + '" out="' + str(frame_end) + '">')
 			print('\t\t<property name="resource"><![CDATA[' + gfile.get_path()  + ']]></property>')
 			if ginfo.get_content_type().startswith("image"):
-				 print(create_mlt_filter_ken_burns(video, frame_duration))
+				 print(create_mlt_filter_ken_burns(file, frame_duration, args.face_detection))
 			print('	</producer>')
 
 			if (args.transitions or args.audio_transitions) and iteration != 0:
